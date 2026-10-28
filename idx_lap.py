@@ -19,10 +19,10 @@ Install (Termux / Linux / Windows):
     pip install curl_cffi      # opsional: bantu tembus proteksi Cloudflare situs IDX
 
 Contoh pakai:
-    python idx_report.py BBCA
-    python idx_report.py BBCA BBRI TLKM --days 365
-    python idx_report.py KOKA --watch 300          # realtime: cek ulang tiap 5 menit
-    python idx_report.py BBCA --out laporan --all  # --all = tampilkan juga pengumuman 'Lainnya'
+    python idx_lap.py BBCA
+    python idx_lap.py BBCA BBRI TLKM --days 365
+    python idx_lap.py KOKA --watch 300          # realtime: cek ulang tiap 5 menit
+    python idx_lap.py BBCA --out laporan --all  # --all = tampilkan juga pengumuman 'Lainnya'
 
 Catatan: ini alat bantu riset, BUKAN rekomendasi beli/jual. Selalu cek ulang ke
 dokumen resmi di idx.co.id sebelum ambil keputusan.
@@ -44,6 +44,30 @@ try:
     import requests
 except ImportError:
     sys.exit("Install dulu: pip install requests reportlab")
+
+# --- FIX error "'usedforsecurity' is an invalid keyword argument for openssl_md5()" ---
+# Terjadi di Python/OpenSSL tertentu saat reportlab memanggil hashlib.md5(usedforsecurity=False).
+import hashlib as _hl
+_orig_md5, _orig_new = _hl.md5, _hl.new
+
+
+def _md5_compat(*a, **k):
+    try:
+        return _orig_md5(*a, **k)
+    except TypeError:
+        k.pop("usedforsecurity", None)
+        return _orig_md5(*a, **k)
+
+
+def _new_compat(*a, **k):
+    try:
+        return _orig_new(*a, **k)
+    except TypeError:
+        k.pop("usedforsecurity", None)
+        return _orig_new(*a, **k)
+
+
+_hl.md5, _hl.new = _md5_compat, _new_compat
 
 try:
     from reportlab.lib import colors
@@ -150,13 +174,38 @@ def yf_symbol(code):
     return code if code.endswith(".JK") else code + ".JK"
 
 
-def get_price(code):
-    d = http_get("https://query1.finance.yahoo.com/v8/finance/chart/%s" % yf_symbol(code),
-                 params={"interval": "1d", "range": "1y"})
+def yget(path, params):
+    """Yahoo punya 2 host; coba keduanya biar tahan rate-limit."""
+    last = None
+    for host in ("query1", "query2"):
+        try:
+            return http_get("https://%s.finance.yahoo.com%s" % (host, path), params=params, retries=1)
+        except Exception as e:  # noqa
+            last = e
+    raise RuntimeError(last)
+
+
+def get_chart(sym, rng="1y"):
+    d = yget("/v8/finance/chart/%s" % quote(sym, safe=""), {"interval": "1d", "range": rng})
     res = d["chart"]["result"][0]
-    m = res["meta"]
-    closes = [c for c in res["indicators"]["quote"][0].get("close", []) if c is not None]
-    price = m.get("regularMarketPrice")
+    q = res["indicators"]["quote"][0]
+    rows = []
+    for i, t in enumerate(res.get("timestamp") or []):
+        c = q["close"][i]
+        if c is None:
+            continue
+        rows.append({"t": t, "c": c,
+                     "o": q["open"][i] if q["open"][i] is not None else c,
+                     "h": q["high"][i] if q["high"][i] is not None else c,
+                     "l": q["low"][i] if q["low"][i] is not None else c,
+                     "v": q["volume"][i] or 0})
+    return res["meta"], rows
+
+
+def get_price(code):
+    m, rows = get_chart(yf_symbol(code))
+    closes = [r["c"] for r in rows]
+    price = m.get("regularMarketPrice") or (closes[-1] if closes else None)
     prev = closes[-2] if len(closes) >= 2 else None
     ts = m.get("regularMarketTime")
     return {
@@ -170,6 +219,7 @@ def get_price(code):
         "w52_high": m.get("fiftyTwoWeekHigh"),
         "w52_low": m.get("fiftyTwoWeekLow"),
         "time": datetime.fromtimestamp(ts).strftime("%d-%m-%Y %H:%M") if ts else "-",
+        "hist": rows,
     }
 
 
@@ -185,10 +235,9 @@ def get_fundamentals(code):
     for k in FIELDS:
         types += ["quarterly" + k, "annual" + k]
     now = int(time.time())
-    d = http_get(
-        "https://query1.finance.yahoo.com/ws/fundamentals-timeseries/v1/finance/timeseries/%s"
-        % yf_symbol(code),
-        params={"type": ",".join(types), "period1": now - 6 * 365 * 86400,
+    d = yget(
+        "/ws/fundamentals-timeseries/v1/finance/timeseries/%s" % yf_symbol(code),
+        {"type": ",".join(types), "period1": now - 6 * 365 * 86400,
                 "period2": now + 86400, "merge": "false", "lang": "id-ID", "region": "ID"})
     out = {}
     for r in d["timeseries"]["result"]:
@@ -237,6 +286,7 @@ def compute(f, price):
     bvps = equity / shares if equity is not None and shares else None
     m.update(basis=basis, assets=assets, liab=liab, equity=equity, shares=shares, ni=ni,
              rev=rev, gp=gp, op=op, eps=eps, bvps=bvps)
+    m["fcf"], _ = ttm_or_fy(f, "FreeCashFlow")
     m["gpm"] = gp / rev * 100 if gp is not None and rev else None
     m["opm"] = op / rev * 100 if op is not None and rev else None
     m["npm"] = ni / rev * 100 if ni is not None and rev else None
@@ -453,6 +503,307 @@ def read_rups_pdf(url):
 
 
 # ----------------------------------------------------------------------------
+# Teknikal, kondisi IHSG & kecocokan gaya main (scalping / day trade / swing)
+# ----------------------------------------------------------------------------
+NAMES = {"scalp": "Scalping (menit-jam)", "day": "Day Trade (hari itu juga)",
+         "swing_s": "Swing Pendek (2-10 hari bursa)", "swing_l": "Swing Panjang (1-3 bulan+)"}
+
+
+def tick(p):
+    """Fraksi harga BEI."""
+    if p < 200:
+        return 1
+    if p < 500:
+        return 2
+    if p < 2000:
+        return 5
+    if p < 5000:
+        return 10
+    return 25
+
+
+def rt(x):
+    x = max(x, 1)
+    t = tick(x)
+    return int(round(x / t)) * t
+
+
+def sma(vals, n):
+    return sum(vals[-n:]) / n if len(vals) >= n else None
+
+
+def ema_series(vals, n):
+    k, out, e = 2.0 / (n + 1), [], None
+    for v in vals:
+        e = v if e is None else v * k + e * (1 - k)
+        out.append(e)
+    return out
+
+
+def rsi(closes, n=14):
+    if len(closes) < n + 1:
+        return None
+    g = l_ = 0.0
+    for i in range(1, n + 1):
+        d = closes[i] - closes[i - 1]
+        g += max(d, 0)
+        l_ += max(-d, 0)
+    ag, al = g / n, l_ / n
+    for i in range(n + 1, len(closes)):
+        d = closes[i] - closes[i - 1]
+        ag = (ag * (n - 1) + max(d, 0)) / n
+        al = (al * (n - 1) + max(-d, 0)) / n
+    return 100.0 if al == 0 else 100 - 100 / (1 + ag / al)
+
+
+def atr(rows, n=14):
+    if len(rows) < n + 1:
+        return None
+    trs = []
+    for i in range(1, len(rows)):
+        h, l_, pc = rows[i]["h"], rows[i]["l"], rows[i - 1]["c"]
+        trs.append(max(h - l_, abs(h - pc), abs(l_ - pc)))
+    a = sum(trs[:n]) / n
+    for tr in trs[n:]:
+        a = (a * (n - 1) + tr) / n
+    return a
+
+
+def macd_hist(closes):
+    if len(closes) < 35:
+        return None, None
+    line = [a - b for a, b in zip(ema_series(closes, 12), ema_series(closes, 26))]
+    sig = ema_series(line, 9)
+    h = [a - b for a, b in zip(line, sig)]
+    return h[-1], h[-2]
+
+
+def technicals(rows):
+    if len(rows) < 30:
+        return None
+    c = [r["c"] for r in rows]
+    v = [r["v"] for r in rows]
+    last = c[-1]
+    t = {"last": last, "sma20": sma(c, 20), "sma50": sma(c, 50), "sma200": sma(c, 200),
+         "rsi": rsi(c), "atr": atr(rows)}
+    t["atr_pct"] = t["atr"] / last * 100 if t["atr"] else None
+    t["macd"], t["macd_prev"] = macd_hist(c)
+    v20 = sum(v[-21:-1]) / 20 if len(v) >= 21 else None
+    t["vol_ratio"] = v[-1] / v20 if v20 else None
+    t["val20"] = sum(r["c"] * r["v"] for r in rows[-20:]) / min(20, len(rows))
+    t["hi20"] = max(r["h"] for r in rows[-20:])
+    t["lo20"] = min(r["l"] for r in rows[-20:])
+    t["ret5"] = growth(last, c[-6]) if len(c) >= 6 else None
+    t["ret20"] = growth(last, c[-21]) if len(c) >= 21 else None
+    return t
+
+
+_IHSG = {"t": 0, "v": None}
+
+
+def ihsg_regime():
+    if time.time() - _IHSG["t"] < 120 and _IHSG["v"]:
+        return _IHSG["v"]
+    _, rows = get_chart("^JKSE")
+    t = technicals(rows)
+    if not t:
+        return None
+    last, sc = t["last"], 0
+    if t["sma20"] and last > t["sma20"]:
+        sc += 30
+    if t["sma50"] and last > t["sma50"]:
+        sc += 30
+    if t["sma200"] and last > t["sma200"]:
+        sc += 20
+    if t["macd"] is not None and t["macd"] > 0:
+        sc += 10
+    if t["rsi"] and 45 <= t["rsi"] <= 70:
+        sc += 10
+    label = "Bullish" if sc >= 70 else "Sideways" if sc >= 40 else "Bearish"
+    res = {"label": label, "score": sc, "last": last, "ret5": t["ret5"], "ret20": t["ret20"], "rsi": t["rsi"]}
+    _IHSG.update(t=time.time(), v=res)
+    return res
+
+
+def fund_score(m):
+    if not m:
+        return 40, ["Data fundamental tidak tersedia, skor netral."]
+    sc, nt = 0, []
+    if m["ni"] is not None and m["ni"] > 0:
+        sc += 15
+    r = m["roe"]
+    if r is not None:
+        sc += 20 if r >= 15 else 10 if r >= 8 else 0
+    y = m["ni_yoy"]
+    if y is not None:
+        sc += 15 if y > 20 else 8 if y > 0 else -10 if y < -20 else 0
+    y = m["rev_yoy"]
+    if y is not None:
+        sc += 10 if y > 10 else 5 if y > 0 else 0
+    if m["pbv"]:
+        sc += 10 if m["pbv"] <= 1 else 6 if m["pbv"] <= 3 else 0
+    if m["per"]:
+        sc += 10 if m["per"] <= 15 else 5 if m["per"] <= 25 else 0
+    if not m["is_bank_like"] and m["der"] is not None:
+        sc += 10 if m["der"] < 1 else 5 if m["der"] < 2 else -5 if m["der"] > 3 else 0
+    if m["cr"] and m["cr"] >= 1.5:
+        sc += 5
+    if m.get("fcf") and m["fcf"] > 0:
+        sc += 5
+    return max(0, min(100, sc)), nt
+
+
+def tech_score(t):
+    sc, last = 0, t["last"]
+    if t["sma20"] and last > t["sma20"]:
+        sc += 15
+    if t["sma50"] and last > t["sma50"]:
+        sc += 15
+    if t["sma200"] and last > t["sma200"]:
+        sc += 15
+    if t["sma20"] and t["sma50"] and t["sma20"] > t["sma50"]:
+        sc += 10
+    if t["macd"] is not None:
+        if t["macd"] > 0:
+            sc += 10
+        if t["macd_prev"] is not None and t["macd"] > t["macd_prev"]:
+            sc += 5
+    r = t["rsi"]
+    if r is not None:
+        sc += 15 if 50 <= r <= 70 else 5 if 40 <= r < 50 else 5 if r < 30 else -10 if r > 75 else 0
+    if t["vol_ratio"] and t["vol_ratio"] >= 1.5 and (t["ret5"] or 0) > 0:
+        sc += 10
+    return max(0, min(100, sc))
+
+
+def activity_score(t):
+    v = t["val20"] or 0
+    sc = 40 if v >= 50e9 else 30 if v >= 10e9 else 18 if v >= 3e9 else 8 if v >= 1e9 else 0
+    a = t["atr_pct"] or 0
+    sc += 35 if 2 <= a <= 6 else 20 if 1.5 <= a < 2 or 6 < a <= 9 else 10 if a > 9 else 5
+    vr = t["vol_ratio"] or 0
+    sc += 25 if vr >= 2 else 15 if vr >= 1.3 else 8 if vr >= 1 else 0
+    return min(100, sc)
+
+
+def catalyst_adj(ann):
+    adj = {"scalp": 0, "day": 0, "swing_s": 0, "swing_l": 0}
+    notes = []
+    since = (datetime.now() - timedelta(days=45)).strftime("%Y-%m-%d")
+    cats = {a["cat"] for a in ann if a["date"] >= since}
+    if "Suspensi / UMA / Delisting" in cats:
+        for k in adj:
+            adj[k] -= 10
+        notes.append("Ada pengumuman UMA/suspensi/pemantauan bursa dalam 45 hari: gerak harga bisa liar, risiko gembok/suspend. Kurangi ukuran posisi.")
+    if "Private Placement (PMTHMETD)" in cats or "Right Issue (PMHMETD)" in cats:
+        adj["swing_l"] -= 8
+        adj["swing_s"] -= 3
+        notes.append("Ada rencana tambah saham baru (private placement/right issue): ada risiko dilusi. Cek harga pelaksanaan & tujuan dana.")
+    if "Buyback" in cats:
+        adj["swing_s"] += 4
+        adj["swing_l"] += 4
+        notes.append("Ada buyback: biasanya jadi bantalan harga dan sinyal manajemen merasa sahamnya murah.")
+    if "Dividen" in cats:
+        adj["swing_s"] += 2
+        notes.append("Ada jadwal dividen: perhatikan cum date. Harga sering naik menjelang cum date lalu turun setelah ex date.")
+    if "Akuisisi / Pengambilalihan" in cats or "Transaksi Material / Afiliasi" in cats:
+        adj["day"] += 3
+        notes.append("Ada kabar akuisisi/transaksi material: bisa jadi katalis, tapi cek nilai, sumber dana, dan apakah pihak terafiliasi.")
+    if "RUPS / RUPSLB" in cats:
+        notes.append("Ada RUPS/RUPSLB dalam 45 hari: baca agendanya (private placement, right issue, anggaran dasar) karena sering jadi penggerak harga.")
+    return adj, notes
+
+
+def analyze_strategy(data):
+    p, m = data["price"], data.get("m")
+    t = technicals(p.get("hist") or [])
+    if not t:
+        return None
+    ih = data.get("ihsg")
+    fs, _ = fund_score(m)
+    ts, act = tech_score(t), activity_score(t)
+    ihs = ih["score"] if ih else 50
+    adj, cnotes = catalyst_adj(data.get("ann", []))
+    sc = {"scalp": .05 * fs + .15 * ts + .15 * ihs + .65 * act,
+          "day": .15 * fs + .30 * ts + .20 * ihs + .35 * act,
+          "swing_s": .25 * fs + .50 * ts + .25 * ihs,
+          "swing_l": .55 * fs + .30 * ts + .15 * ihs}
+    why = {k: [] for k in sc}
+    val = t["val20"] or 0
+    for k, need in (("scalp", 10e9), ("day", 3e9), ("swing_s", 1e9), ("swing_l", 1e9)):
+        if val < need:
+            sc[k] = min(sc[k], 30)
+            why[k].append("Kurang likuid (rata-rata transaksi %s/hari, idealnya min. %s): susah masuk-keluar tanpa geser harga." % (rp(val), rp(need)))
+    if t["atr_pct"] is not None and t["atr_pct"] < 1.5:
+        for k in ("scalp", "day"):
+            sc[k] = min(sc[k], 40)
+            why[k].append("Gerak harian sempit (ATR %s%%): ruang cuan tipis dibanding biaya beli-jual (~0,3-0,5%%)." % num(t["atr_pct"]))
+    if m and m["ni"] is not None and m["ni"] <= 0:
+        sc["swing_l"] = min(sc["swing_l"], 40)
+        sc["swing_s"] = min(sc["swing_s"], 65)
+        why["swing_l"].append("Laba bersih negatif: belum layak ditahan lama berbasis fundamental.")
+    if ih and ih["label"] == "Bearish":
+        sc["swing_s"] = min(sc["swing_s"], 60)
+        sc["swing_l"] = min(sc["swing_l"], 65)
+        why["swing_s"].append("IHSG lagi Bearish: saham bagus pun sering ikut ditarik turun. Tunggu IHSG membaik atau perkecil posisi.")
+        why["swing_l"].append("IHSG lagi Bearish: kalau mau akumulasi, bertahap (cicil) dan siapkan cash.")
+    if t["sma200"] and t["last"] < t["sma200"]:
+        sc["swing_l"] = min(sc["swing_l"], 60)
+        why["swing_l"].append("Harga masih di bawah SMA200 (belum uptrend jangka panjang).")
+    if t["rsi"] and t["rsi"] > 75:
+        sc["swing_s"] -= 10
+        why["swing_s"].append("RSI %s sudah overbought: rawan koreksi, lebih enak masuk saat pullback." % num(t["rsi"], 0))
+    if fs >= 70:
+        why["swing_l"].append("Fundamental kuat: laba bagus butuh waktu 'dihargai' pasar, jadi lebih enak ditahan.")
+    if fs < 45:
+        why["swing_l"].append("Fundamental lemah: tidak ada 'jangkar' kalau harga jatuh.")
+    for k in sc:
+        sc[k] = max(0, min(100, sc[k] + adj[k]))
+    verdict = {k: ("COCOK" if v >= 70 else "BOLEH (selektif)" if v >= 55 else "HINDARI / TUNGGU") for k, v in sc.items()}
+    best = max(sc, key=lambda k: sc[k])
+    if sc[best] < 55:
+        best = None
+    flags = []
+    last = t["last"]
+    for lab, key in (("SMA20", "sma20"), ("SMA50", "sma50"), ("SMA200", "sma200")):
+        if t[key]:
+            flags.append("%s %s %s" % ("di atas" if last > t[key] else "di bawah", lab, num(t[key], 0)))
+    facts = ["Fundamental: skor %d/100 (%s)." % (fs, "kuat" if fs >= 70 else "cukup" if fs >= 45 else "lemah"),
+             "Teknikal: skor %d/100; harga %s." % (ts, ", ".join(flags) if flags else "-"),
+             "RSI %s, MACD histogram %s." % (num(t["rsi"], 0), "positif" if (t["macd"] or 0) > 0 else "negatif"),
+             "Aktivitas: transaksi rata-rata %s/hari, ATR %s%% per hari, volume terakhir %sx rata-rata 20 hari." % (rp(val), num(t["atr_pct"]), num(t["vol_ratio"])),
+             "Support/resisten 20 hari: %s / %s." % (num(t["lo20"], 0), num(t["hi20"], 0))]
+    if ih:
+        facts.append("IHSG: %s (skor %d/100), 5 hari %s, 20 hari %s." % (ih["label"], ih["score"], pct(ih["ret5"]), pct(ih["ret20"])))
+    plan = trade_plan(best, last, t) if best else None
+    return {"scores": sc, "verdict": verdict, "why": why, "best": best, "plan": plan,
+            "fs": fs, "ts": ts, "act": act, "facts": facts, "notes": cnotes, "tech": t, "ihsg": ih}
+
+
+def trade_plan(key, price, t):
+    atr_ = t["atr"] or price * 0.03
+    sl_m, rr1, rr2, hold = {
+        "scalp": (0.4, 1.5, 2.5, "Menit sampai jam. WAJIB tutup hari ini, jangan dibawa pulang."),
+        "day": (0.8, 1.5, 2.5, "Intraday. Tutup sebelum penutupan, hari itu juga selesai."),
+        "swing_s": (1.5, 1.5, 2.5, "Sekitar 2-10 hari bursa. Evaluasi tiap hari, geser SL naik kalau sudah profit."),
+        "swing_l": (2.5, 2.0, 3.5, "Sekitar 1-3 bulan atau lebih. Pantau laporan keuangan & arah IHSG, boleh cicil masuk."),
+    }[key]
+    risk = sl_m * atr_
+    lo = price - (0.2 if key in ("scalp", "day") else 1.0) * atr_
+    if key.startswith("swing") and t["sma20"]:
+        lo = max(lo, t["sma20"])
+    lo = min(lo, price)
+    plan = {"hold": hold, "entry_lo": rt(lo), "entry_hi": rt(price), "sl": rt(price - risk),
+            "tp1": rt(price + rr1 * risk), "tp2": rt(price + rr2 * risk), "rr1": rr1, "rr2": rr2,
+            "risk_pct": risk / price * 100, "note": ""}
+    if plan["tp1"] > t["hi20"] > price:
+        plan["note"] = "TP1 melewati resisten 20 hari (%s), bisa tertahan di sana; pertimbangkan ambil sebagian di resisten." % num(t["hi20"], 0)
+    per_lot = risk * 100
+    plan["lot_example"] = int(1_000_000 / per_lot) if per_lot > 0 else 0
+    return plan
+
+
+# ----------------------------------------------------------------------------
 # Ambil semua data satu emiten
 # ----------------------------------------------------------------------------
 def collect(code, days, show_all, deep_rups=True):
@@ -491,6 +842,13 @@ def collect(code, days, show_all, deep_rups=True):
         ann = [a for a in ann if a["cat"] != "Lainnya"]
     data["ann"] = ann
     data["news"] = [n for n in news if n["cat"] != "Lainnya" or show_all][:15]
+
+    try:
+        data["ihsg"] = ihsg_regime()
+    except Exception as e:  # noqa
+        data["ihsg"] = None
+        data["errors"].append("Data IHSG gagal diambil: %s" % e)
+    data["strat"] = analyze_strategy(data) if data["price"].get("hist") else None
 
     data["rups"] = []
     if deep_rups:
@@ -583,6 +941,45 @@ def fin_table(f, st, width):
     return make_table(rows, [first] + [rest] * len(dates), st), prefix
 
 
+def add_strategy_section(s, sg, st, W):
+    s.append(Paragraph("1a. Cocoknya Main Apa? (Scalping / Day Trade / Swing)", st["h"]))
+    for f_ in sg["facts"]:
+        s.append(Paragraph("&bull; " + escape(safe(f_)), st["b"]))
+    s.append(Spacer(1, 4))
+    rows = [["Gaya main", "Skor", "Vonis", "Catatan"]]
+    colr = {"COCOK": "#0b7a3b", "BOLEH (selektif)": "#b26a00", "HINDARI / TUNGGU": "#b3261e"}
+    for k in ("scalp", "day", "swing_s", "swing_l"):
+        v = sg["verdict"][k]
+        rows.append([NAMES[k], "%d" % round(sg["scores"][k]),
+                     '<font color="%s"><b>%s</b></font>' % (colr[v], v),
+                     " ".join(sg["why"][k]) or "-"])
+    s.append(make_table(rows, [W * 0.25, W * 0.08, W * 0.17, W * 0.50], st))
+    s.append(Spacer(1, 4))
+    b = sg["best"]
+    if b is None:
+        s.append(Paragraph("<b>Kesimpulan: TUNGGU DULU.</b> Belum ada gaya main yang skornya meyakinkan (di bawah 55). "
+                           "Lebih aman pantau sampai tren/volume/IHSG membaik.", st["b"]))
+    else:
+        pl = sg["plan"]
+        s.append(Paragraph("<b>Kesimpulan: paling cocok %s (skor %d).</b>" % (escape(NAMES[b]), round(sg["scores"][b])), st["b"]))
+        pr = [["Rencana (contoh, bukan perintah)", "Level"],
+              ["Zona entry", "%s - %s" % (num(pl["entry_lo"], 0), num(pl["entry_hi"], 0))],
+              ["Stop loss (cut loss)", "%s  (risiko sekitar %s dari harga)" % (num(pl["sl"], 0), pct(pl["risk_pct"]))],
+              ["Target 1 (RR 1:%s)" % num(pl["rr1"], 1), num(pl["tp1"], 0)],
+              ["Target 2 (RR 1:%s)" % num(pl["rr2"], 1), num(pl["tp2"], 0)],
+              ["Durasi pegang", pl["hold"]],
+              ["Ukuran posisi", "Risiko maks. 1-2%% modal per transaksi. Contoh modal Rp 100 jt, risiko 1%% = Rp 1 jt, maks. sekitar %d lot." % pl["lot_example"]]]
+        s.append(make_table(pr, [W * 0.28, W * 0.72], st))
+        if pl["note"]:
+            s.append(Paragraph(escape(pl["note"]), st["s"]))
+    for n_ in sg["notes"]:
+        s.append(Paragraph("&bull; " + escape(safe(n_)), st["b"]))
+    s.append(Paragraph("Cara baca: skor dihitung dari fundamental, teknikal harian (SMA, RSI, MACD, ATR, volume), kondisi IHSG, "
+                       "likuiditas, dan kabar aksi korporasi. Data harian, jadi untuk scalping/day trade ini hanya penyaring "
+                       "'layak dimainkan atau tidak', bukan sinyal entry menit-an. Mengingat ARA/ARB dan biaya transaksi, "
+                       "cek chart intraday sebelum eksekusi. Ini model aturan sederhana, bukan saran investasi.", st["s"]))
+
+
 def build_pdf(data, path):
     st = styles()
     doc = SimpleDocTemplate(path, pagesize=A4, leftMargin=1.5 * cm, rightMargin=1.5 * cm,
@@ -620,6 +1017,10 @@ def build_pdf(data, path):
         s.append(Spacer(1, 3))
         s.append(Paragraph("Dasar hitung laba: %s. Posisi neraca per %s." % (m["basis"] or "-", m["period"]), st["s"]))
 
+        pass
+    if data.get("strat"):
+        add_strategy_section(s, data["strat"], st, W)
+    if m:
         # 2. laporan keuangan
         s.append(Paragraph("2. Laporan Keuangan", st["h"]))
         tbl, prefix = fin_table(data["fund"], st, W)
@@ -725,6 +1126,14 @@ def run_once(code, args, cache, force=False):
     changed = old != fp
     px = data["price"].get("price")
     print("[%s] %s harga: %s" % (datetime.now().strftime("%H:%M:%S"), code, num(px, 0) if px else "-"))
+    for e in data["errors"]:
+        print("   [!] %s" % e)
+    sg = data.get("strat")
+    if sg:
+        ih = sg.get("ihsg")
+        print("   IHSG: %s | Fundamental %d | Teknikal %d" % (ih["label"] if ih else "-", sg["fs"], sg["ts"]))
+        print("   Skor: " + " | ".join("%s %d" % (NAMES[k].split(" (")[0], round(v)) for k, v in sg["scores"].items()))
+        print("   >> Paling cocok: %s" % (NAMES[sg["best"]] if sg["best"] else "TUNGGU DULU (belum ada yang meyakinkan)"))
     if changed and old:
         if old.get("period") != fp.get("period"):
             print("   >> LAPORAN KEUANGAN BARU terdeteksi (periode %s -> %s)" % (old.get("period"), fp.get("period")))
